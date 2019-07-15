@@ -1,0 +1,17 @@
+version: 2
+jobs:
+  build:
+    working_directory: ~/repo
+    docker:
+      - image: shopstic/circleci-sbt:8u212-1.2.8
+
+    steps:
+      - checkout
+      - setup_remote_docker:
+      - run:
+          name: Docker login
+          command: |
+            docker login -u $DOCKER_HUB_USERNAME -p $DOCKER_HUB_PASSWORD
+      - run:
+          name: Build
+          command: sbt compile

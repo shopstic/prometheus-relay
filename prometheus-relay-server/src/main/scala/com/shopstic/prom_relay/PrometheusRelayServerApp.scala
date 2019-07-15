@@ -2,7 +2,7 @@ package com.shopstic.prom_relay
 
 import java.time.Instant
 
-import akka.NotUsed
+import akka.{Done, NotUsed}
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model.ws.{BinaryMessage, Message, TextMessage}
@@ -26,7 +26,7 @@ object PrometheusRelayServerApp extends AkkaApp {
     originLabel: String,
     bindingInterface: String,
     bindingPort: PortNumber,
-    scrapeTimeout: FiniteDuration,
+    scrapeTimeout: Timeout,
     scrapeInterval: FiniteDuration
   )
 
@@ -36,10 +36,12 @@ object PrometheusRelayServerApp extends AkkaApp {
 
   trait MetricSnapshotService {
     def getMetrics: String
+
     def updateMetrics(origin: String, metrics: List[Metric]): Unit
   }
 
   object MetricSnapshotService {
+
     trait Live extends MetricSnapshotService {
       private val state = TrieMap.empty[String, List[Metric]]
 
@@ -57,6 +59,7 @@ object PrometheusRelayServerApp extends AkkaApp {
         state.update(origin, metrics)
       }
     }
+
   }
 
   type Env = AkkaApp.Env with MetricSnapshotService with Cfg
@@ -84,50 +87,53 @@ object PrometheusRelayServerApp extends AkkaApp {
       import akka.http.scaladsl.server.Directives._
       import env._
 
-      def createHandler(origin: String) = {
-        Flow[Message]
-          .map(_.asBinaryMessage)
-          .mapAsync(1) {
-            case BinaryMessage.Streamed(s) =>
-              s.runFold(ByteString.empty)(_ ++ _)
-            case BinaryMessage.Strict(s) =>
-              Future.successful(s)
-          }
-          .flatMapConcat { s =>
-            Parser().parseE(s.utf8String) match {
-              case Left(error) =>
-                Source.failed(ParseException(error))
-
-              case Right(parsed) =>
-                Source.single(ScrapeSnapshot(origin, parsed.map(transformMetric(_, origin))))
+      Task.fromFuture {
+        _ =>
+          val baseFlow = Flow[Message]
+            .map(_.asBinaryMessage)
+            .mapAsync(1) {
+              case BinaryMessage.Streamed(s) =>
+                s.runFold(ByteString.empty)(_ ++ _)
+              case BinaryMessage.Strict(s) =>
+                Future.successful(s)
             }
-          }
-          .via(handler)
-          .map(r => TextMessage(r.toString))
-      }
 
-      val route = concat(
-        path("join" / ".+".r) { origin =>
-          get {
-            handleWebSocketMessages(createHandler(origin))
-          }
-        },
-        path("metrics") {
-          get {
-            complete(getMetrics)
-          }
-        }
-      )
+          def createWsHandler(origin: String) = {
+            baseFlow
+              .flatMapConcat { s =>
+                Parser().parseE(s.utf8String) match {
+                  case Left(error) =>
+                    Source.failed(ParseException(error))
 
-      Task.fromFuture { _ =>
-        Http().bindAndHandle(route, bindingInterface, bindingPort.value)
+                  case Right(parsed) =>
+                    Source.single(ScrapeSnapshot(origin, parsed.map(transformMetric(_, origin))))
+                }
+              }
+              .via(handler)
+              .map(r => TextMessage(r.toString))
+          }
+
+          val route = concat(
+            path("join" / ".+".r) { origin =>
+              get {
+                handleWebSocketMessages(createWsHandler(origin))
+              }
+            },
+            path("metrics") {
+              get {
+                complete(getMetrics)
+              }
+            }
+          )
+
+          Http().bindAndHandle(route, bindingInterface, bindingPort.value)
       }
     }) { binding =>
       Task.fromFuture(_ => binding.unbind()).orDie
     }
   }
 
-  protected def createMergeHub(sink: Sink[ScrapeSnapshot, NotUsed]) = {
+  protected def createMergeHub[Mat](sink: Sink[ScrapeSnapshot, Mat]) = {
     ZIO.access[AkkaEnv] { env =>
       import env._
       MergeHub.source[ScrapeSnapshot](perProducerBufferSize = 16).to(sink).run()
@@ -159,14 +165,12 @@ object PrometheusRelayServerApp extends AkkaApp {
       .merge(Source.single(Instant.now))
   }
 
-  protected def createSink: ZIO[MetricSnapshotService, Nothing, Sink[ScrapeSnapshot, NotUsed]] = {
+  protected def createSink: ZIO[MetricSnapshotService, Nothing, Sink[ScrapeSnapshot, Future[Done]]] = {
     ZIO.access[MetricSnapshotService] { env =>
-      Flow[ScrapeSnapshot]
-        .map {
-          case ScrapeSnapshot(origin, metrics) =>
-            env.updateMetrics(origin, metrics)
-        }
-        .to(Sink.ignore)
+      Sink.foreach[ScrapeSnapshot] {
+        case ScrapeSnapshot(origin, metrics) =>
+          env.updateMetrics(origin, metrics)
+      }
     }
   }
 

@@ -23,7 +23,7 @@ lazy val server = Build
     dockerUsername := Some("shopstic"),
     dockerExposedPorts := Seq(8080),
     daemonUser in Docker := "app",
-    dockerEntrypoint := Seq.empty
+    dockerEntrypoint := Seq("/opt/docker/bin/prometheus-relay-server")
   )
 
 lazy val sample = Build
