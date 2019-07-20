@@ -1,42 +1,73 @@
 package com.shopstic.prom_relay
 
-import akka.Done
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.model.ws._
 import akka.stream.KillSwitches
-import akka.stream.scaladsl.{Flow, Keep, Sink}
+import akka.stream.scaladsl.{Flow, Keep, RestartFlow, Sink}
 import dev.chopsticks.fp.{AkkaEnv, LogEnv, LoggingContext, ZIOExt}
+import pureconfig.ConfigConvert
+import pureconfig.ConfigConvert.viaNonEmptyStringTry
+import pureconfig.generic.FieldCoproductHint
 import zio.{TaskR, ZIO}
 
 import scala.concurrent.Future
+import scala.concurrent.duration._
+import scala.util.Try
 
 object PrometheusRelayClients extends LoggingContext {
-  def createClient(
+  sealed trait PrometheusRelayConfig
+  final case class EnabledPrometheusRelayConfig(
     originId: String,
     serverUri: Uri,
-    clientMetricsUri: Uri
-  ): TaskR[AkkaEnv with LogEnv, (WebSocketUpgradeResponse, Done)] = {
+    clientMetricsUri: Uri,
+    retryMinBackoff: FiniteDuration,
+    retryMaxBackoff: FiniteDuration,
+    retryRandomFactor: Double,
+    idleTimeout: FiniteDuration
+  ) extends PrometheusRelayConfig
+  object DisabledPrometheusRelayConfig extends PrometheusRelayConfig
+
+  object PrometheusRelayConfig {
+    import dev.chopsticks.util.config.PureconfigConverters._
+
+    implicit val uriConfigConverter: ConfigConvert[Uri] = viaNonEmptyStringTry[Uri](s => Try(Uri(s)), _.toString)
+
+    implicit val hint: FieldCoproductHint[PrometheusRelayConfig] =
+      new FieldCoproductHint[PrometheusRelayConfig]("state") {
+        override def fieldValue(name: String): String = name.dropRight("PrometheusRelayConfig".length).toLowerCase()
+      }
+
+    //noinspection TypeAnnotation
+    implicit val configConverter = ConfigConvert[PrometheusRelayConfig]
+  }
+
+  def createClient(config: EnabledPrometheusRelayConfig): TaskR[AkkaEnv with LogEnv, Unit] = {
     ZIOExt.interruptableGraph(
       ZIO.access[AkkaEnv with LogEnv] { env =>
         import env._
 
         val ks = KillSwitches.shared("prometheus-relay-client-killswitch")
 
-        val webSocketFlow = Http().webSocketClientFlow(
-          WebSocketRequest(
-            uri = serverUri.withPath(Uri.Path / "join" / originId)
-          )
-        )
+        val webSocketFlow =
+          RestartFlow.withBackoff(config.retryMinBackoff, config.retryMaxBackoff, config.retryRandomFactor) { () =>
+            Http()
+              .webSocketClientFlow(
+                WebSocketRequest(
+                  uri = config.serverUri.withPath(Uri.Path / "join" / config.originId)
+                )
+              )
+              .idleTimeout(config.idleTimeout)
+          }
 
         val scrapeFlow = Flow[Message]
           .map(_.asTextMessage.getStrictText)
           .wireTap(
-            time => env.logger.debug(s"[$time] Scraping metrics from local client: ${clientMetricsUri.toString}")
+            time => env.logger.debug(s"[$time] Scraping metrics from local client: ${config.clientMetricsUri.toString}")
           )
           .mapAsync(1) { _ =>
             Http()
-              .singleRequest(HttpRequest(uri = clientMetricsUri))
+              .singleRequest(HttpRequest(uri = config.clientMetricsUri))
               .flatMap { res =>
                 if (res.status.isSuccess()) {
                   Future.successful(BinaryMessage(res.entity.dataBytes.via(ks.flow)))
@@ -58,20 +89,9 @@ object PrometheusRelayClients extends LoggingContext {
 
         Flow[Message]
           .via(ks.flow)
-          .viaMat(webSocketFlow)(Keep.right)
-          .joinMat(scrapeFlow)(Keep.both)
-          .mapMaterializedValue {
-            case (upgradeFuture, streamFuture) =>
-              (
-                ks,
-                upgradeFuture
-                  .flatMap {
-                    case upgrade @ (_: ValidUpgrade) => Future.successful(upgrade)
-                    case InvalidUpgradeResponse(_, cause) => Future.failed(new IllegalStateException(cause))
-                  }
-                  .zip(streamFuture)
-              )
-          }
+          .via(webSocketFlow)
+          .joinMat(scrapeFlow)(Keep.right)
+          .mapMaterializedValue(f => (ks, f.map(_ => ())))
       },
       graceful = true
     )
