@@ -9,7 +9,7 @@ import dev.chopsticks.fp.{AkkaEnv, LogEnv, LoggingContext, ZIOExt}
 import pureconfig.ConfigConvert
 import pureconfig.ConfigConvert.viaNonEmptyStringTry
 import pureconfig.generic.FieldCoproductHint
-import zio.{TaskR, ZIO}
+import zio.{RIO, ZIO}
 
 import scala.concurrent.Future
 import scala.concurrent.duration._
@@ -42,7 +42,7 @@ object PrometheusRelayClients extends LoggingContext {
     implicit val configConverter = ConfigConvert[PrometheusRelayConfig]
   }
 
-  def createClient(config: EnabledPrometheusRelayConfig): TaskR[AkkaEnv with LogEnv, Unit] = {
+  def createClient(config: EnabledPrometheusRelayConfig): RIO[AkkaEnv with LogEnv, Unit] = {
     ZIOExt.interruptableGraph(
       ZIO.access[AkkaEnv with LogEnv] { env =>
         import env._
