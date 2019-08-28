@@ -2,19 +2,20 @@ package com.shopstic.prom_relay
 
 import java.time.Instant
 
-import akka.{Done, NotUsed}
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model.ws.{BinaryMessage, Message, TextMessage}
 import akka.stream.scaladsl.{Flow, MergeHub, Sink, Source}
 import akka.util.{ByteString, Timeout}
+import akka.{Done, NotUsed}
 import com.github.pawelj_pl.prometheus_metrics_parser.parser.{ParseException, Parser}
 import com.github.pawelj_pl.prometheus_metrics_parser.{Metric, MetricValue}
 import com.typesafe.config.Config
 import dev.chopsticks.fp.{AkkaApp, AkkaEnv, ConfigEnv, ZLogger}
 import dev.chopsticks.util.config.PureconfigLoader
 import eu.timepit.refined.types.net.PortNumber
-import zio.{Task, ZIO, ZManaged}
+import pureconfig.ConfigConvert
+import zio.{Task, ZIO, ZManaged, ZSchedule}
 
 import scala.collection.concurrent.TrieMap
 import scala.concurrent.Future
@@ -27,36 +28,61 @@ object PrometheusRelayServerApp extends AkkaApp {
     bindingInterface: String,
     bindingPort: PortNumber,
     scrapeTimeout: Timeout,
-    scrapeInterval: FiniteDuration
+    scrapeInterval: FiniteDuration,
+    pruneExpiry: FiniteDuration,
+    pruneInterval: FiniteDuration
   )
+
+  object AppConfig {
+    //noinspection TypeAnnotation
+    implicit val configConvert = {
+      import dev.chopsticks.util.config.PureconfigConverters._
+      import eu.timepit.refined.pureconfig._
+      ConfigConvert[AppConfig]
+    }
+  }
 
   type Cfg = ConfigEnv[AppConfig]
 
   final case class ScrapeSnapshot(origin: String, metrics: List[Metric])
 
   trait MetricSnapshotService {
-    def getMetrics: String
+    def render(): String
 
-    def updateMetrics(origin: String, metrics: List[Metric]): Unit
+    def prune(expiry: FiniteDuration): List[String]
+
+    def update(origin: String, metrics: List[Metric]): Unit
   }
 
   object MetricSnapshotService {
+    final case class MetricSnapshotState(lastUpdated: Instant, metrics: List[Metric])
 
     trait Live extends MetricSnapshotService {
-      private val state = TrieMap.empty[String, List[Metric]]
+      private val state = TrieMap.empty[String, MetricSnapshotState]
 
-      def getMetrics: String = {
+      def render(): String = {
         val output = state.values
-          .flatMap { metrics =>
-            metrics.map(_.render)
+          .flatMap {
+            case MetricSnapshotState(_, metrics) =>
+              metrics.map(_.render)
           }
           .mkString("\n\n")
-        state.clear()
         output
       }
 
-      def updateMetrics(origin: String, metrics: List[Metric]): Unit = {
-        state.update(origin, metrics)
+      def prune(expiry: FiniteDuration): List[String] = {
+        val now = Instant.now
+        val expiryNanos = expiry.toNanos
+        val toPrune = state.collect {
+          case (k, s) if java.time.Duration.between(s.lastUpdated, now).toNanos > expiryNanos =>
+            k
+        }.toList
+        val _ = state --= toPrune
+        toPrune
+      }
+
+      def update(origin: String, metrics: List[Metric]): Unit = {
+        state.update(origin, MetricSnapshotState(Instant.now, metrics))
       }
     }
 
@@ -66,7 +92,6 @@ object PrometheusRelayServerApp extends AkkaApp {
 
   protected def createEnv(untypedConfig: Config) = {
     import dev.chopsticks.util.config.PureconfigConverters._
-    import eu.timepit.refined.pureconfig._
 
     ZManaged.environment[AkkaApp.Env].map { env =>
       new AkkaApp.LiveEnv with MetricSnapshotService.Live with Cfg {
@@ -121,7 +146,7 @@ object PrometheusRelayServerApp extends AkkaApp {
             },
             path("metrics") {
               get {
-                complete(getMetrics)
+                complete(render())
               }
             }
           )
@@ -169,7 +194,7 @@ object PrometheusRelayServerApp extends AkkaApp {
     ZIO.access[MetricSnapshotService] { env =>
       Sink.foreach[ScrapeSnapshot] {
         case ScrapeSnapshot(origin, metrics) =>
-          env.updateMetrics(origin, metrics)
+          env.update(origin, metrics)
       }
     }
   }
@@ -185,8 +210,19 @@ object PrometheusRelayServerApp extends AkkaApp {
       sink <- createSink
       mergeHub <- createMergeHub(sink)
       handler = createHandler(mergeHub, appConfig.scrapeTimeout, appConfig.scrapeInterval)
+      pruneFib <- ZIO
+        .access[MetricSnapshotService](_.prune(appConfig.pruneExpiry))
+        .repeat(ZSchedule.fixed(zio.duration.Duration.fromScala(appConfig.pruneInterval)).logInput {
+          pruned: List[String] =>
+            if (pruned.nonEmpty) {
+              ZLogger.info(s"Pruned: ${pruned.size} keys: ${pruned.mkString(", ")}")
+            }
+            else ZIO.unit
+        })
+        .fork
       _ <- createServer(handler, appConfig.bindingInterface, appConfig.bindingPort, transformer).use { binding =>
         ZLogger.info(s"Server is up: ${binding.localAddress}") *> ZIO.never.unit
       }
+      _ <- pruneFib.join
     } yield ()
 }

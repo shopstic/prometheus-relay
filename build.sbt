@@ -19,7 +19,9 @@ lazy val server = Build
   .enablePlugins(JavaAppPackaging, DockerPlugin)
   .settings(
     libraryDependencies ++= chopsticksFpDeps ++ akkaHttpDeps ++ prometheusMetricParserDeps ++ refinedDeps,
-    dockerBaseImage := "oracle/graalvm-ce:19.1.0",
+//    dockerBaseImage := "oracle/graalvm-ce:19.1.0",
+//    dockerBaseImage := "adoptopenjdk:11.0.4_11-jre-hotspot",
+    dockerBaseImage := "openjdk:11-jre-slim",
     dockerUsername := Some("shopstic"),
     dockerExposedPorts := Seq(8080),
     daemonUser in Docker := "app",
