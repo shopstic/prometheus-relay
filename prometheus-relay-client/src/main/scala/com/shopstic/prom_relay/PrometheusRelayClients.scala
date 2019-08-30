@@ -4,8 +4,9 @@ import akka.http.scaladsl.Http
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.model.ws._
 import akka.stream.KillSwitches
-import akka.stream.scaladsl.{Flow, Keep, RestartFlow, Sink}
-import dev.chopsticks.fp.{AkkaEnv, LogEnv, LoggingContext, ZIOExt}
+import akka.stream.scaladsl.{Flow, Keep, RestartFlow, Sink, Source}
+import akka.util.ByteString
+import dev.chopsticks.fp.{AkkaEnv, LogEnv, LoggingContext, ZAkka}
 import pureconfig.ConfigConvert
 import pureconfig.ConfigConvert.viaNonEmptyStringTry
 import pureconfig.generic.FieldCoproductHint
@@ -20,7 +21,7 @@ object PrometheusRelayClients extends LoggingContext {
   final case class EnabledPrometheusRelayConfig(
     originId: String,
     serverUri: Uri,
-    clientMetricsUri: Uri,
+    clientMetricsUris: List[Uri],
     retryMinBackoff: FiniteDuration,
     retryMaxBackoff: FiniteDuration,
     retryRandomFactor: Double,
@@ -43,7 +44,7 @@ object PrometheusRelayClients extends LoggingContext {
   }
 
   def createClient(config: EnabledPrometheusRelayConfig): RIO[AkkaEnv with LogEnv, Unit] = {
-    ZIOExt.interruptableGraph(
+    ZAkka.interruptableGraph(
       ZIO.access[AkkaEnv with LogEnv] { env =>
         import env._
 
@@ -60,29 +61,44 @@ object PrometheusRelayClients extends LoggingContext {
               .idleTimeout(config.idleTimeout)
           }
 
+        def scrapeClient(uri: Uri) = {
+          Http()
+            .singleRequest(HttpRequest(uri = uri))
+            .flatMap { res =>
+              if (res.status.isSuccess()) {
+                Future.successful(res.entity.dataBytes.via(ks.flow))
+              }
+              else {
+                res.entity.dataBytes
+                  .via(ks.flow)
+                  .runWith(Sink.ignore)
+                  .flatMap(
+                    _ =>
+                      Future.failed(
+                        new IllegalStateException(
+                          s"Local client metrics (uri = $uri) scraping failed with status: ${res.status}"
+                        )
+                      )
+                  )
+              }
+            }
+        }
+
         val scrapeFlow = Flow[Message]
           .map(_.asTextMessage.getStrictText)
           .wireTap(
-            time => env.logger.debug(s"[$time] Scraping metrics from local client: ${config.clientMetricsUri.toString}")
+            time =>
+              env.logger.debug(
+                s"[$time] Scraping metrics from local clients: ${config.clientMetricsUris.map(_.toString).mkString(", ")}"
+              )
           )
           .mapAsync(1) { _ =>
-            Http()
-              .singleRequest(HttpRequest(uri = config.clientMetricsUri))
-              .flatMap { res =>
-                if (res.status.isSuccess()) {
-                  Future.successful(BinaryMessage(res.entity.dataBytes.via(ks.flow)))
-                }
-                else {
-                  res.entity.dataBytes
-                    .via(ks.flow)
-                    .runWith(Sink.ignore)
-                    .flatMap(
-                      _ =>
-                        Future.failed(
-                          new IllegalStateException(s"Local client metrics scraping failed with status: ${res.status}")
-                        )
-                    )
-                }
+            Future
+              .sequence(config.clientMetricsUris.map(scrapeClient))
+              .map { results =>
+                BinaryMessage(results.foldLeft(Source.empty[ByteString]) { (a, b) =>
+                  a ++ Source.single(ByteString("\n")) ++ b
+                })
               }
           }
           .watchTermination() { case (_, f) => f }

@@ -1,12 +1,14 @@
 package com.shopstic.prom_relay
 
+import java.util.concurrent.TimeUnit
+
 import akka.http.scaladsl.model.Uri
-import com.shopstic.prom_relay.PrometheusRelayClients.PrometheusRelayClientConfig
+import com.shopstic.prom_relay.PrometheusRelayClients.EnabledPrometheusRelayConfig
 import com.typesafe.config.Config
 import dev.chopsticks.fp.AkkaApp
 import zio.ZManaged
+
 import scala.concurrent.duration._
-import dev.chopsticks.fp.ZIOExt.Implicits._
 
 object SampleClientApp extends AkkaApp {
   type Env = AkkaApp.Env
@@ -17,10 +19,10 @@ object SampleClientApp extends AkkaApp {
     for {
       f <- PrometheusRelayClients
         .createClient(
-          PrometheusRelayClientConfig(
+          EnabledPrometheusRelayConfig(
             originId = "foobar",
-            serverUri = Uri("wss://prom-relay.gega3.com"),
-            clientMetricsUri = Uri("http://localhost:9095"),
+            serverUri = Uri("ws://localhost:8080"),
+            clientMetricsUris = List(Uri("http://localhost:9095")),
             retryMinBackoff = 500.millis,
             retryMaxBackoff = 10.seconds,
             retryRandomFactor = 0.2,
@@ -29,7 +31,7 @@ object SampleClientApp extends AkkaApp {
         )
         .fork
 
-      _ <- f.interrupt.delay(5.seconds)
+      _ <- f.interrupt.delay(zio.duration.Duration(5, TimeUnit.SECONDS))
     } yield ()
   }
 }
