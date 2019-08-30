@@ -5,7 +5,7 @@ object Dependencies {
   val SCALA_VERSION = "2.12.9"
 
   val chopsticksFpDeps = Seq(
-    "dev.chopsticks" %% "chopsticks-fp" % "0.16.1"
+    "dev.chopsticks" %% "chopsticks-fp" % "0.17.0"
   )
 
   val prometheusMetricParserDeps = Seq(

@@ -30,6 +30,9 @@ lazy val server = Build
 
 lazy val sample = Build
   .defineProject("sample")
+  .settings(
+    publish / skip := true
+  )
   .dependsOn(client)
 
 lazy val root = (project in file("."))
@@ -39,4 +42,4 @@ lazy val root = (project in file("."))
     dependencyUpdates := {},
     publish / skip := true
   )
-  .aggregate(server, client)
+  .aggregate(sample, server, client)

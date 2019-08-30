@@ -8,7 +8,7 @@ import sbt.Keys._
 //noinspection TypeAnnotation
 object Build {
   val rootProjectName = "prometheus-relay"
-  val buildVersion = "0.3.0"
+  val buildVersion = "0.5.0"
 
   val symlinkTargetRoot = file(sys.env("HOME")) / ".sbt-targets" / "shopstic" / "prometheus-relay"
 
