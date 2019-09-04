@@ -44,7 +44,7 @@ object PrometheusRelayClients extends LoggingContext {
   }
 
   def createClient(config: EnabledPrometheusRelayConfig): RIO[AkkaEnv with LogEnv, Unit] = {
-    ZAkka.interruptableGraph(
+    ZAkka.interruptableGraphM(
       ZIO.access[AkkaEnv with LogEnv] { env =>
         import env._
 
